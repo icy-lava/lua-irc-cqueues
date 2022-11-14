@@ -1,4 +1,6 @@
-local socket = require "socket"
+local socket = require "cqueues.socket"
+local auxlib = require "cqueues.auxlib"
+local errno = require "cqueues.errno"
 
 local error = error
 local setmetatable = setmetatable
@@ -91,31 +93,17 @@ function meta_preconnect:connect(_host, _port)
 	host = host or error("host name required to connect", 2)
 	port = port or 6667
 
-	local s = socket.tcp()
+	local s = socket.connect(host, port)
 
-	s:settimeout(timeout or 30)
-	assert(s:connect(host, port))
-
-	if secure then
-		local work, ssl = pcall(require, "ssl")
-		if not work then
-			error("LuaSec required for secure connections", 2)
-		end
-
-		local params
-		if type(secure) == "table" then
-			params = secure
-		else
-			params = {mode = "client", protocol = "tlsv1"}
-		end
-
-		s = ssl.wrap(s, params)
-		success, errmsg = s:dohandshake()
+	auxlib.assert(s:connect(timeout or 30))
+	
+	if secure ~= false then
+		local success, errmsg = s:starttls()
 		if not success then
 			error(("could not make secure connection: %s"):format(errmsg), 2)
 		end
 	end
-
+	
 	self.socket = s
 	setmetatable(self, meta)
 
@@ -133,11 +121,8 @@ function meta_preconnect:connect(_host, _port)
 
 	self.channels = {}
 
-	s:settimeout(0)
-
 	repeat
-		self:think()
-		socket.select(nil, nil, 0.1) -- Sleep so that we don't eat CPU
+		self:waitAuthenticate(false)
 	until self.authed
 end
 
@@ -155,29 +140,50 @@ function meta:shutdown()
 	setmetatable(self, nil)
 end
 
-local function getline(self, errlevel)
-	local line, err = self.socket:receive("*l")
-
-	if not line and err ~= "timeout" and err ~= "wantread" then
-		self:invoke("OnDisconnect", err, true)
-		self:shutdown()
-		error(err, errlevel)
+local function getline(self, errlevel, timeout)
+	if timeout == nil then timeout = 0 end
+	local line, err = self.socket:xread("*l", nil, timeout)
+	if not line then
+		err = errno[err]
+		if err == "ETIMEDOUT" or err == "EAGAIN" then
+			self.socket:clearerr()
+		else
+			self:invoke("OnDisconnect", err, true)
+			self:shutdown()
+			error(err, errlevel)
+		end
 	end
 
 	return line
 end
 
-function meta:think()
+local function think(self, timeout, waitAuthenticate)
 	while true do
-		local line = getline(self, 3)
+		local line = getline(self, 3, timeout)
 		if line and #line > 0 then
+			local authed = self.authed
 			if not self:invoke("OnRaw", line) then
 				self:handle(parse(line))
+			end
+			if waitAuthenticate and self.authed and not authed then
+				break
 			end
 		else
 			break
 		end
 	end
+end
+
+function meta:waitAuthenticate(timeout)
+	think(self, timeout, true)
+end
+
+function meta:think(timeout)
+	think(self, timeout, false)
+end
+
+function meta:loop()
+	self:think(false)
 end
 
 local handlers = handlers

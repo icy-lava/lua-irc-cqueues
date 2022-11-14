@@ -3,6 +3,7 @@ local assert = assert
 local error = error
 local select = select
 local pairs = pairs
+local errno = require "cqueues.errno"
 
 module "irc"
 
@@ -14,12 +15,17 @@ function meta:send(msg, ...)
 	end
 	self:invoke("OnSend", msg)
 
-	local bytes, err = self.socket:send(msg .. "\r\n")
+	local bytes, err = self.socket:xwrite(msg .. "\r\n", nil, false)
 
-	if not bytes and err ~= "timeout" and err ~= "wantwrite" then
-		self:invoke("OnDisconnect", err, true)
-		self:shutdown()
-		error(err, errlevel)
+	if not bytes then
+		err = errno[err]
+		if err == "ETIMEDOUT" or err == "EAGAIN" then
+			self.socket:clearerr()
+		else
+			self:invoke("OnDisconnect", err, true)
+			self:shutdown()
+			error(err, errlevel)
+		end
 	end
 end
 
